@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# FileX service manager. Installed globally as /usr/local/bin/FileX.
+
+set -Eeuo pipefail
+
+SERVICE="filex.service"
+CLI_CONFIG="/etc/filex.conf"
+
+if [[ -r "$CLI_CONFIG" ]]; then
+    # shellcheck disable=SC1090
+    source "$CLI_CONFIG"
+fi
+
+FILEX_DIR="${FILEX_DIR:-/opt/FileX}"
+FILEX_USER="${FILEX_USER:-${SUDO_USER:-${USER:-root}}}"
+ENV_FILE="$FILEX_DIR/.env"
+VENV_DIR="$FILEX_DIR/venv"
+
+colour() {
+    local code="$1"
+    shift
+    printf '\033[%sm%s\033[0m\n' "$code" "$*"
+}
+
+info() { colour "1;36" "$*"; }
+success() { colour "1;32" "$*"; }
+error() { colour "1;31" "$*" >&2; }
+
+as_root() {
+    if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+        "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
+    else
+        error "This command requires root privileges (sudo is not installed)."
+        exit 1
+    fi
+}
+
+as_filex_user() {
+    if [[ "$(id -un)" == "$FILEX_USER" ]]; then
+        "$@"
+    elif [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+        runuser -u "$FILEX_USER" -- "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo -u "$FILEX_USER" -- "$@"
+    else
+        error "Cannot run this command as $FILEX_USER (sudo is not installed)."
+        exit 1
+    fi
+}
+
+require_installation() {
+    if [[ ! -d "$FILEX_DIR" || ! -f "$FILEX_DIR/main.py" ]]; then
+        error "FileX is not installed at $FILEX_DIR."
+        exit 1
+    fi
+}
+
+service_action() {
+    as_root systemctl "$1" "$SERVICE"
+    success "FileX service ${1} command completed."
+}
+
+show_status() {
+    as_root systemctl status "$SERVICE" --no-pager || true
+    printf '\n'
+    local pid
+    pid="$(systemctl show "$SERVICE" --property=MainPID --value 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && [[ -r "/proc/$pid/status" ]]; then
+        info "Resource usage (PID $pid)"
+        ps -p "$pid" -o pid,ppid,%cpu,%mem,rss,vsz,etime,cmd
+    else
+        info "Resource usage unavailable because FileX is not running."
+    fi
+}
+
+prompt_value() {
+    local key="$1"
+    local label="$2"
+    local optional="${3:-false}"
+    local default="${4:-}"
+    local current value prompt
+
+    current="$(read_env "$key")"
+    [[ -n "$current" ]] || current="$default"
+    prompt="$label"
+    if [[ -n "$current" ]]; then
+        if [[ "$key" == "API_HASH" || "$key" == "BOT_TOKEN" || "$key" == "DATABASE_URL" ]]; then
+            prompt+=" [press Enter to keep current]"
+        else
+            prompt+=" [$current]"
+        fi
+    elif [[ "$optional" == "true" ]]; then
+        prompt+=" [optional]"
+    fi
+
+    while true; do
+        read -r -p "$prompt: " value </dev/tty
+        [[ -n "$value" ]] || value="$current"
+        if [[ -n "$value" || "$optional" == "true" ]]; then
+            set_env "$key" "$value"
+            return
+        fi
+        error "$label is required."
+    done
+}
+
+read_env() {
+    local key="$1"
+    [[ -f "$ENV_FILE" ]] || return 0
+    awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); value=$0} END {print value}' "$ENV_FILE"
+}
+
+set_env() {
+    local key="$1"
+    local value="$2"
+    local temporary
+    temporary="$(mktemp)"
+    if [[ -f "$ENV_FILE" ]]; then
+        awk -F= -v key="$key" '$1 != key' "$ENV_FILE" >"$temporary"
+    fi
+    printf '%s=%s\n' "$key" "$value" >>"$temporary"
+    as_root install -o "$FILEX_USER" -g "$(id -gn "$FILEX_USER")" -m 600 "$temporary" "$ENV_FILE"
+    rm -f "$temporary"
+}
+
+configure() {
+    require_installation
+    info "Update FileX configuration (press Enter to retain an existing value)."
+    prompt_value API_ID "Telegram API ID"
+    prompt_value API_HASH "Telegram API hash"
+    prompt_value BOT_TOKEN "Bot token"
+    prompt_value OWNER_ID "Owner Telegram user ID"
+    prompt_value CHANNEL_ID "Private database channel ID"
+    prompt_value DATABASE_URL "MongoDB connection URL"
+    prompt_value FORCE_SUB_CHANNEL "Force-subscription channel ID" true "0"
+    as_root chown "$FILEX_USER:$(id -gn "$FILEX_USER")" "$ENV_FILE"
+    as_root chmod 600 "$ENV_FILE"
+    as_root systemctl restart "$SERVICE"
+    success "Configuration saved and FileX restarted."
+}
+
+update_filex() {
+    require_installation
+    info "Updating FileX from Git…"
+    as_filex_user git -C "$FILEX_DIR" pull --ff-only
+    as_filex_user "$VENV_DIR/bin/python" -m pip install \
+        --upgrade -r "$FILEX_DIR/requirements.txt"
+    as_root install -o root -g root -m 755 "$FILEX_DIR/FileX" "/usr/local/bin/FileX"
+    as_root systemctl restart "$SERVICE"
+    success "FileX, its dependencies, and the global CLI were updated."
+}
+
+uninstall_filex() {
+    read -r -p "Remove the FileX service and CLI? The repository and .env will be kept. [y/N]: " answer </dev/tty
+    if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+        info "Uninstall cancelled."
+        return
+    fi
+    as_root systemctl disable --now "$SERVICE" 2>/dev/null || true
+    as_root rm -f "/etc/systemd/system/$SERVICE" "$CLI_CONFIG" "/usr/local/bin/FileX"
+    as_root systemctl daemon-reload
+    success "Service and global CLI removed. Project data remains at $FILEX_DIR."
+}
+
+usage() {
+    cat <<'EOF'
+Usage: FileX <command>
+
+Commands:
+  start       Start filex.service
+  stop        Stop filex.service
+  restart     Restart filex.service
+  status      Show service status and process resource usage
+  logs        Stream service logs
+  config      Interactively update .env and restart
+  update      Pull code, update dependencies, and restart
+  uninstall   Remove the service and global CLI (keeps project data)
+  help        Show this help
+EOF
+}
+
+interactive_menu() {
+    while true; do
+        clear 2>/dev/null || true
+        colour "1;35" "╔══════════════════════════════╗"
+        colour "1;35" "║       FileX Manager          ║"
+        colour "1;35" "╚══════════════════════════════╝"
+        cat <<'EOF'
+  1) Start
+  2) Stop
+  3) Restart
+  4) Status
+  5) Live logs
+  6) Configure
+  7) Update
+  8) Uninstall
+  0) Exit
+EOF
+        read -r -p "Select an option: " choice </dev/tty
+        case "$choice" in
+            1) service_action start ;;
+            2) service_action stop ;;
+            3) service_action restart ;;
+            4) show_status ;;
+            5) as_root journalctl -u "$SERVICE" -f ;;
+            6) configure ;;
+            7) update_filex ;;
+            8) uninstall_filex; return ;;
+            0) return ;;
+            *) error "Invalid selection." ;;
+        esac
+        read -r -p "Press Enter to continue…" _ </dev/tty
+    done
+}
+
+command="${1:-menu}"
+case "$command" in
+    start|stop|restart) service_action "$command" ;;
+    status) show_status ;;
+    logs) as_root journalctl -u "$SERVICE" -f ;;
+    config) configure ;;
+    update) update_filex ;;
+    uninstall) uninstall_filex ;;
+    help|-h|--help) usage ;;
+    menu) interactive_menu ;;
+    *) error "Unknown command: $command"; usage; exit 2 ;;
+esac
